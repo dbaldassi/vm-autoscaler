@@ -1,0 +1,10 @@
+[package]
+name = "vm_autoscaler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ctrlc = "3.4.7"
+sysinfo = "0.35.2"
+virt = "0.4.2"
+virt-sys = "0.3.0"
