@@ -16,10 +16,10 @@ use sysinfo::{System};
 use std::ffi::CString;
 
 use csv::Writer;
-use serde::Serialize;
+// use serde::Serialize;
 
 // use cgroups_proactive_reclaim;
-// use cgroups_proactive_reclaim::CgroupsReclaimManager;
+use cgroups_proactive_reclaim::CgroupsReclaimManager;
 
 const ROOT_XML_PATH: &str = "/home/tobias/Documents/medooze-vm-monitor/root.xml";
 const ROOT_IMG_PATH: &str = "/var/lib/libvirt/images/medooze.qcow2";
@@ -43,6 +43,27 @@ unsafe extern "C" {
 struct XmlConfig {
     vm_name: String,
     disk_img: String, // in MB
+}
+
+enum RegulationMethod {
+    CgroupsProactiveReclaim(CgroupsReclaimManager),
+    // Other methods can be added here
+}
+
+struct DomMemStats {
+    swap_in: u64,
+    swap_out: u64,
+    major_fault: u64,
+    minor_fault: u64,
+    unused: u64,
+    available: u64,
+    actual_balloon: u64,
+    rss: u64,
+    usable: u64,
+    last_update: u64,
+    disk_caches: u64,
+    huge_tlb_pgalloc: u64,
+    huge_tlb_pgfail: u64,
 }
 
 #[derive(serde::Serialize, Default)]
@@ -97,7 +118,7 @@ const WATTSUP_NUM_METRICS: usize = 18;
 
 fn create_csv_writer(path: &str) -> Writer<std::fs::File> {
     let file = std::fs::File::create(path).expect("Failed to create CSV file");
-    let mut wtr = Writer::from_writer(file);
+    let wtr = Writer::from_writer(file);
 
     wtr
 }
@@ -211,27 +232,78 @@ fn init_wattsup() -> i32 {
             return -1;
         }
 
-        println!("WattsUp device opened successfully: {}", dev_fd);
         wu_clear(dev_fd);
     }
     
-    println!("WattsUp device cleared successfully");
     dev_fd
+}
+
+fn fetch_dommemstats(domain: &Domain) -> DomMemStats {
+    let stats = domain.memory_stats(0).expect("Failed to get memory stats");
+    
+    let mut dom_mem_stats = DomMemStats {
+        swap_in: 0,
+        swap_out: 0,
+        major_fault: 0,
+        minor_fault: 0,
+        unused: 0,
+        available: 0,
+        actual_balloon: 0,
+        rss: 0,
+        usable: 0,
+        last_update: 0,
+        disk_caches: 0,
+        huge_tlb_pgalloc: 0,
+        huge_tlb_pgfail: 0,
+    };
+
+    for s in stats {
+        match s.tag {
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_SWAP_IN => dom_mem_stats.swap_in = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_SWAP_OUT => dom_mem_stats.swap_out = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_MAJOR_FAULT => dom_mem_stats.major_fault = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_MINOR_FAULT => dom_mem_stats.minor_fault = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_UNUSED => dom_mem_stats.unused = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_AVAILABLE => dom_mem_stats.available = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_ACTUAL_BALLOON => dom_mem_stats.actual_balloon = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_RSS => dom_mem_stats.rss = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_USABLE => dom_mem_stats.usable = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_LAST_UPDATE => dom_mem_stats.last_update = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_DISK_CACHES => dom_mem_stats.disk_caches = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_HUGETLB_PGALLOC => dom_mem_stats.huge_tlb_pgalloc = s.val,
+            virt_sys::VIR_DOMAIN_MEMORY_STAT_HUGETLB_PGFAIL => dom_mem_stats.huge_tlb_pgfail = s.val,
+            _ => {}
+        }
+    }
+
+    dom_mem_stats
+}
+
+fn regulate_domain(domain: &Domain, method: &mut RegulationMethod) {
+    const THRESHOLD : u64 = 1024 * 1024 * 200; // 200 MB
+
+    let stats = fetch_dommemstats(domain);
+
+    let swap = stats.swap_out - stats.swap_in;
+    let used = stats.available - stats.usable + swap;
+
+    println!("Swap In: {}, Swap Out: {}, Available: {}, Used Memory: {}", stats.swap_in, stats.swap_out, stats.available, used);
+
+    match method {
+        RegulationMethod::CgroupsProactiveReclaim(manager) => {
+            // Call the proactive reclaim method
+            manager.regulate(used, THRESHOLD).expect("Failed to regulate domain with CgroupsProactiveReclaim");
+        }
+        // Add other methods here
+    }
 }
 
 fn main() {
     let mut sys = System::new_all();
-    let mut domains = Vec::new();
+    let mut domains: Vec<(Domain, RegulationMethod)> = Vec::new();
     let mut conn = Connect::open(Some("qemu:///system")).expect("Failed to connect to hypervisor");
-    // let domain = Domain::lookup_by_name(&mut conn, "medooze").expect("Failed to find domain");
-
-    // domain.create().expect("Failed to start domain");
-
-    // println!("Pwd : {}", std::env::current_dir().unwrap().display());
-    println!("Current working directory: {}", std::env::current_dir().unwrap().display());
 
     let wattsup = init_wattsup();
-    println!("WattsUp device file descriptor: {}", wattsup);
     if wattsup < 0 {
         std::process::exit(1);
     }
@@ -264,10 +336,14 @@ fn main() {
     while running.load(Ordering::SeqCst) {
         let free_memory = fetch_free_memory(&mut sys);
 
+        for (domain, regulation) in &mut domains {
+            regulate_domain(&domain, regulation);
+        }
+
         if time_since_vm_creation >= WAIT_TIME && free_memory > VM_INITIAL_MEMORY + VM_SAFETY_MEMORY {
             let config = XmlConfig {
-                vm_name: format!("sfu-{}", num_vm),
-                disk_img: format!("{}/sfu-{}.qcow2", VM_IMG_PATH, num_vm), // 1 GB
+                vm_name: format!("sfu{}", num_vm),
+                disk_img: format!("{}/sfu{}.qcow2", VM_IMG_PATH, num_vm), // 1 GB
             };
 
             println!("Creating VM {} with disk image", config.vm_name);
@@ -277,15 +353,19 @@ fn main() {
             let domain = define_new_vm(&mut conn, &xml);
             domain.create().expect("Failed to start new VM");
             num_vm += 1;
-            
-            // std::thread::sleep(std::time::Duration::from_secs(60));
-            
             // let ipv4 = get_vm_ipv4(&domain);
-            domains.push(domain);
-            // println!("VM {} created with IPv4: {}", config.vm_name, ipv4);
+            
+            std::thread::sleep(std::time::Duration::from_secs(1)); // wait for the VM to start
+            time += 1;
+
+            let cgroup_path = cgroups_proactive_reclaim::get_cgroup_path(&config.vm_name)
+            .expect("Failed to get cgroup path");
+            let cgroups_manager = CgroupsReclaimManager::new(&cgroup_path);
+            
+            domains.push((domain, RegulationMethod::CgroupsProactiveReclaim(cgroups_manager)));
+
             time_since_vm_creation = 0;
         } else {
-            // std::thread::sleep(std::time::Duration::from_secs(1));
             time_since_vm_creation += 1;
         }
 
@@ -293,9 +373,8 @@ fn main() {
             wu_get_data(wattsup, wattsup_data.as_mut_ptr());
         }
 
-        // println!("WattsUp Data: {:?}", wattsup_data);
         let mut logentry = LogEntry {
-            timestamp: start.elapsed().as_secs(),
+            timestamp: time,
             cpu_usage: sys.global_cpu_usage() as f64,
             memory_usage: sys.used_memory() / (1024 * 1024), // convert to MB
             num_vm: num_vm as u32,
@@ -321,7 +400,7 @@ fn main() {
     println!("Free memory at start: {} GB", initial_free_memory / (1024 * 1024 * 1024));
 
     // cleanup
-    for domain in domains {
+    for (domain,_) in &domains {
         domain.destroy().expect("Failed to shutdown domain");
         domain.undefine().expect("Failed to undefine domain");
     }
