@@ -12,6 +12,14 @@ if len(sys.argv) < 2:
 csv_file = sys.argv[1]
 df = pl.read_csv(csv_file)
 
+watts = df["watts"].to_numpy()
+
+# Trouver l'indice de la première valeur > 0
+start_idx = next((i for i, w in enumerate(watts) if w > 0), 0)
+
+# Filtrer le DataFrame à partir de cet indice
+df = df.slice(start_idx, len(df) - start_idx)
+
 timestamp = df["timestamp"].to_numpy()
 outdir = os.path.dirname(os.path.abspath(csv_file))
 basename = os.path.splitext(os.path.basename(csv_file))[0]

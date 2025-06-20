@@ -11,3 +11,4 @@ sysinfo = "0.35.2"
 virt = "0.4.2"
 virt-sys = "0.3.0"
 cgroups-proactive-reclaim = { path = "../cgroups-proactive-reclaim" }
+chrono = "0.4.41"

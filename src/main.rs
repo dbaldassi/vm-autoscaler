@@ -10,10 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use std::time::Instant;
+use std::env;
 
 use sysinfo::{System};
 
 use std::ffi::CString;
+
+use chrono::Local;
 
 use csv::Writer;
 // use serde::Serialize;
@@ -47,6 +50,7 @@ struct XmlConfig {
 
 enum RegulationMethod {
     CgroupsProactiveReclaim(CgroupsReclaimManager),
+    None,
     // Other methods can be added here
 }
 
@@ -287,21 +291,31 @@ fn regulate_domain(domain: &Domain, method: &mut RegulationMethod) {
     let swap = stats.swap_out - stats.swap_in;
     let used = stats.available - stats.usable + swap;
 
-    println!("Swap In: {}, Swap Out: {}, Available: {}, Used Memory: {}", stats.swap_in, stats.swap_out, stats.available, used);
-
     match method {
         RegulationMethod::CgroupsProactiveReclaim(manager) => {
             // Call the proactive reclaim method
             manager.regulate(used, THRESHOLD).expect("Failed to regulate domain with CgroupsProactiveReclaim");
-        }
+        },
+        RegulationMethod::None => {
+            // No regulation method, do nothing
+        },
         // Add other methods here
     }
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    let requested_method = if args.len() > 1 {
+        args[1].clone()
+    } else {
+        "none".to_string()
+    };
+
     let mut sys = System::new_all();
     let mut domains: Vec<(Domain, RegulationMethod)> = Vec::new();
     let mut conn = Connect::open(Some("qemu:///system")).expect("Failed to connect to hypervisor");
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
 
     let wattsup = init_wattsup();
     if wattsup < 0 {
@@ -331,13 +345,19 @@ fn main() {
 
     std::fs::create_dir_all(VM_IMG_PATH).expect(format!("Failed to create {} directory", VM_IMG_PATH).as_str());
 
-    let mut wtr = create_csv_writer("vm_autoscaler_log.csv");
+    let mut wtr = create_csv_writer(format!("vm_autoscaler_log_{}_{}.csv", requested_method, timestamp).as_str());
 
     while running.load(Ordering::SeqCst) {
         let free_memory = fetch_free_memory(&mut sys);
 
         for (domain, regulation) in &mut domains {
             regulate_domain(&domain, regulation);
+            match regulation {
+                RegulationMethod::CgroupsProactiveReclaim(manager) => {
+                    manager.dump_mem_stats(time);
+                },
+                RegulationMethod::None => {},
+            }
         }
 
         if time_since_vm_creation >= WAIT_TIME && free_memory > VM_INITIAL_MEMORY + VM_SAFETY_MEMORY {
@@ -358,12 +378,14 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_secs(1)); // wait for the VM to start
             time += 1;
 
-            let cgroup_path = cgroups_proactive_reclaim::get_cgroup_path(&config.vm_name)
-            .expect("Failed to get cgroup path");
-            let cgroups_manager = CgroupsReclaimManager::new(&cgroup_path);
-            
-            domains.push((domain, RegulationMethod::CgroupsProactiveReclaim(cgroups_manager)));
+            let regulation_method = if requested_method == "cgroups" {
+                RegulationMethod::CgroupsProactiveReclaim(CgroupsReclaimManager::new(&config.vm_name))
+            } else {
+                RegulationMethod::None
+            };
 
+            domains.push((domain, regulation_method));
+            
             time_since_vm_creation = 0;
         } else {
             time_since_vm_creation += 1;
